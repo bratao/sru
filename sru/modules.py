@@ -8,10 +8,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.utils.rnn import PackedSequence
+from einops import rearrange, repeat, reduce
 
 from sru.ops import (elementwise_recurrence_cpu,
                      elementwise_recurrence_gpu,
                      elementwise_recurrence_naive)
+
 
 
 class SRUCell(nn.Module):
@@ -686,6 +688,34 @@ class SRUppProjectedLinear(nn.Module):
         return output
 
 
+class RotaryEmbedding(nn.Module):
+
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        inv_freq = 1. / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+        self.seq_len_cached = None
+        self.emb_cached = None
+
+    def forward(self, x, seq_dim=1):
+        seq_len = x.shape[seq_dim]
+        if seq_len != self.seq_len_cached:
+            self.seq_len_cached = seq_len
+            t = torch.arange(x.shape[seq_dim], device=x.device).type_as(self.inv_freq)
+            freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
+            self.emb_cached =  emb[None, :, :]
+        return self.emb_cached
+
+def rotate_half(x):
+    x = rearrange(x, '... (j d) -> ... j d', j = 2)
+    x1, x2 = x.unbind(dim = -2)
+    return torch.cat((-x2, x1), dim = -1)
+
+def apply_rotary_pos_emb(q, k, freqs):
+    q, k = map(lambda t: (t * freqs.cos()) + (rotate_half(t) * freqs.sin()), (q, k))
+    return q, k
+
 class SRUppAttention(nn.Module):
     """
     Self-attention module used in SRU++ module.
@@ -746,6 +776,8 @@ class SRUppAttention(nn.Module):
         self.alpha = nn.Parameter(torch.Tensor([float(rezero_init_alpha)]))  # type: ignore
         self.normalize_after = normalize_after
         self.layer_norm: Optional[nn.Module] = None
+
+
         if layer_norm:
             self.layer_norm = nn.LayerNorm(proj_features)
 
@@ -774,7 +806,8 @@ class SRUppAttention(nn.Module):
                 mask_pad: Optional[Tensor] = None,
                 attn_mask: Optional[Tensor] = None,
                 memory: Optional[Tensor] = None,
-                memory_mask_pad: Optional[Tensor] = None) -> Tensor:
+                memory_mask_pad: Optional[Tensor] = None,
+                rotary_pos_emb=None) -> Tensor:
         """The forward method of SRU++ attention.
         """
 
@@ -785,6 +818,8 @@ class SRUppAttention(nn.Module):
         num_heads = self.num_heads
         head_dim = proj_dim // num_heads
         scaling = float(head_dim) ** -0.5
+
+
 
         # concat memory and input as the key-value block when provided
         if memory is not None:
@@ -812,11 +847,19 @@ class SRUppAttention(nn.Module):
                     z = layer_norm(z)
             q = z
 
+
         # query, key, value
         k, v = self.linear2(z).chunk(2, dim=-1)
         q = q.contiguous().view(tgt_len, -1, head_dim).transpose(0, 1)
         k = k.contiguous().view(src_len, -1, head_dim).transpose(0, 1)
         v = v.contiguous().view(src_len, -1, head_dim).transpose(0, 1)
+
+        if rotary_pos_emb is not None:
+            l = rotary_pos_emb.shape[-1]
+            (ql, qr), (kl, kr) = map(lambda t: (t[..., :l], t[..., l:]), (q, k))
+            ql, kl = apply_rotary_pos_emb(ql, kl, rotary_pos_emb)
+            q = torch.cat((ql, qr), dim=-1)
+            k = torch.cat((kl, kr), dim=-1)
 
         # (bsz * num_heads, tgt_len, src_len)
         q = q * scaling
@@ -881,7 +924,9 @@ class SRUppCell(SRUCell):
                 mask_pad: Optional[Tensor] = None,
                 attn_mask: Optional[Tensor] = None,
                 memory: Optional[Tensor] = None,
-                memory_mask_pad: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+                memory_mask_pad: Optional[Tensor] = None,
+                rotary_pos_emb=None
+                ) -> Tuple[Tensor, Tensor]:
         """The forward method of the SRU++ layer.
         """
 
@@ -918,10 +963,17 @@ class SRUppCell(SRUCell):
         # compute U
         #   U is (length, batch_size, output_size * num_matrices)
         transform_module = self.transform_module
-        U = transform_module(input, mask_pad=mask_pad,
-                             attn_mask=attn_mask,
-                             memory=memory,
-                             memory_mask_pad=memory_mask_pad)
+        if isinstance(transform_module, SRUppAttention):
+            U = transform_module(input, mask_pad=mask_pad,
+                                 attn_mask=attn_mask,
+                                 memory=memory,
+                                 memory_mask_pad=memory_mask_pad,
+                                 rotary_pos_emb=rotary_pos_emb)
+        else:
+            U = transform_module(input, mask_pad=mask_pad,
+                                 attn_mask=attn_mask,
+                                 memory=memory,
+                                 memory_mask_pad=memory_mask_pad)
         V = self.weight_c
 
         # apply elementwise recurrence to get hidden states h and c
@@ -1026,6 +1078,9 @@ class SRUpp(nn.Module):
             nn.init.xavier_uniform_(self.input_to_hidden.weight)
         else:
             first_layer_input_size = input_size
+
+        rotary_emb_dim = 32
+        self.rotary_pos_emb = RotaryEmbedding(rotary_emb_dim)
 
         for i in range(num_layers):
             # create the i-th SRU layer
@@ -1156,7 +1211,7 @@ class SRUpp(nn.Module):
 
         if input_size != self.input_size:
             raise ValueError("Input has size (*, *, {}) but expect a last dimension of {}".format(
-                input_size, self.input_size
+                input_size, self.input_to_hidden
             ))
 
         if c0 is None:
@@ -1195,6 +1250,10 @@ class SRUpp(nn.Module):
         lstc = []
         i = 0
         x = x.contiguous()
+
+        rotary_pos_emb = self.rotary_pos_emb(input, 0)
+        #rotary_pos_emb = None
+
         for rnn in self.rnn_lst:
             prev_inputs.append(x)
             memory_i = memory[i] if memory is not None else None
@@ -1202,7 +1261,8 @@ class SRUpp(nn.Module):
                        mask_pad=mask_pad,
                        attn_mask=attn_mask,
                        memory=memory_i,
-                       memory_mask_pad=memory_mask_pad)
+                       memory_mask_pad=memory_mask_pad,
+                       rotary_pos_emb=rotary_pos_emb)
             x = h
             lstc.append(c)
             i += 1
